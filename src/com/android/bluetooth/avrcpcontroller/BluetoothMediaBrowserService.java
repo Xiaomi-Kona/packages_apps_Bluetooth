@@ -54,7 +54,7 @@ import java.util.List;
  */
 public class BluetoothMediaBrowserService extends MediaBrowserServiceCompat {
     private static final String TAG = "BluetoothMediaBrowserService";
-    private static final boolean DBG = Log.isLoggable(TAG, Log.DEBUG);
+    private static final boolean DBG = true;
 
     private static BluetoothMediaBrowserService sBluetoothMediaBrowserService;
 
@@ -62,6 +62,7 @@ public class BluetoothMediaBrowserService extends MediaBrowserServiceCompat {
 
     // Browsing related structures.
     private List<MediaSessionCompat.QueueItem> mMediaQueue = new ArrayList<>();
+
 
     // Error messaging extras
     public static final String ERROR_RESOLUTION_ACTION_INTENT =

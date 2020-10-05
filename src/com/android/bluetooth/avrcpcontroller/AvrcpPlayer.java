@@ -29,7 +29,7 @@ import java.util.Arrays;
  */
 class AvrcpPlayer {
     private static final String TAG = "AvrcpPlayer";
-    private static final boolean DBG = Log.isLoggable(TAG, Log.DEBUG);
+    private static final boolean DBG = true;
 
     public static final int INVALID_ID = -1;
 
@@ -56,6 +56,8 @@ class AvrcpPlayer {
     private PlayerApplicationSettings mSupportedPlayerApplicationSettings =
             new PlayerApplicationSettings();
     private PlayerApplicationSettings mCurrentPlayerApplicationSettings;
+
+    private TrackInfo mCurrentTrackInfo = new TrackInfo();
 
     AvrcpPlayer() {
         mId = INVALID_ID;
@@ -214,5 +216,13 @@ class AvrcpPlayer {
                 .setActions(mAvailableActions).build();
 
         if (DBG) Log.d(TAG, "Supported Actions = " + mAvailableActions);
+    }
+
+    public synchronized void updateCurrentTrackInfo(TrackInfo update) {
+        mCurrentTrackInfo = update;
+    }
+
+    public synchronized TrackInfo getCurrentTrackInfo() {
+        return mCurrentTrackInfo;
     }
 }

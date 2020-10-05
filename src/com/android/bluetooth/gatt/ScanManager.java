@@ -50,6 +50,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -78,8 +79,13 @@ public class ScanManager {
     private static final int MSG_SUSPEND_SCANS = 4;
     private static final int MSG_RESUME_SCANS = 5;
     private static final int MSG_IMPORTANCE_CHANGE = 6;
+    /*For suspending both unfiltered & filtered scans*/
+    private static final int MSG_SUSPEND_SCAN_ALL = 7;
+    /* To handle display changed events in Handler thread context to avoid ANR */
+    private static final int MSG_HANDLE_DISPLAY_CHANGED = 8;
     private static final String ACTION_REFRESH_BATCHED_SCAN =
             "com.android.bluetooth.gatt.REFRESH_BATCHED_SCAN";
+
 
     // Timeout for each controller operation.
     private static final int OPERATION_TIME_OUT_MILLIS = 500;
@@ -93,6 +99,7 @@ public class ScanManager {
     private GattService mService;
     private BroadcastReceiver mBatchAlarmReceiver;
     private boolean mBatchAlarmReceiverRegistered;
+    private boolean mIsAptXLowLatencyModeEnabled;
     private ScanNative mScanNative;
     private volatile ClientHandler mHandler;
 
@@ -281,6 +288,7 @@ public class ScanManager {
 
         @Override
         public void handleMessage(Message msg) {
+            Log.i(TAG, "msg.what = " + msg.what);
             switch (msg.what) {
                 case MSG_START_BLE_SCAN:
                     handleStartScan((ScanClient) msg.obj);
@@ -302,6 +310,12 @@ public class ScanManager {
                     break;
                 case MSG_IMPORTANCE_CHANGE:
                     handleImportanceChange((UidImportance) msg.obj);
+                    break;
+                case MSG_SUSPEND_SCAN_ALL:
+                    handleSuspendScanAll();
+                    break;
+                case MSG_HANDLE_DISPLAY_CHANGED:
+                    handleScanOnDisplayChanged();
                     break;
                 default:
                     // Shouldn't happen.
@@ -347,13 +361,28 @@ public class ScanManager {
                 return;
             }
 
+            if (isAptXLowLatencyModeEnabled()) {
+                Log.i(TAG, "Cannot start Scan when aptX LL mode is enabled. This scan will be"
+                        + " resumed when aptX LL mode is disabled: " + client.scannerId);
+                mSuspendedScanClients.add(client);
+                if (client.stats != null) {
+                    client.stats.recordScanSuspend(client.scannerId);
+                }
+                return;
+            }
+
             // Begin scan operations.
             if (isBatchClient(client)) {
                 mBatchClients.add(client);
                 mScanNative.startBatchScan(client);
             } else {
                 mRegularScanClients.add(client);
-                mScanNative.startRegularScan(client);
+                boolean ret = mScanNative.startRegularScan(client);
+                if (!ret) {
+                    mRegularScanClients.remove(client);
+                    return;
+                }
+
                 if (!mScanNative.isOpportunisticScanClient(client)) {
                     mScanNative.configureRegularScanParams();
 
@@ -369,12 +398,30 @@ public class ScanManager {
 
         void handleStopScan(ScanClient client) {
             Utils.enforceAdminPermission(mService);
+            boolean appDied;
+            int scannerId;
             if (client == null) {
                 return;
             }
 
             if (mSuspendedScanClients.contains(client)) {
                 mSuspendedScanClients.remove(client);
+            }
+
+            // The caller may pass a dummy client with only clientIf
+            // and appDied status. Perform the operation on the
+            // actual client in that case.
+            appDied = client.appDied;
+            scannerId = client.scannerId;
+            client = mScanNative.getRegularScanClient(scannerId);
+            if (client == null) {
+                if (DBG) Log.d(TAG, "regular client is null");
+                client = mScanNative.getBatchScanClient(scannerId);
+
+                if(client == null) {
+                    if (DBG) Log.d(TAG,"batch client is null");
+                    return;
+                }
             }
 
             if (mRegularScanClients.contains(client)) {
@@ -387,10 +434,10 @@ public class ScanManager {
                 if (!mScanNative.isOpportunisticScanClient(client)) {
                     mScanNative.configureRegularScanParams();
                 }
-            } else {
+            } else if (mBatchClients.contains(client)) {
                 mScanNative.stopBatchScan(client);
             }
-            if (client.appDied) {
+            if (appDied) {
                 if (DBG) {
                     Log.d(TAG, "app died, unregister scanner - " + client.scannerId);
                 }
@@ -432,6 +479,18 @@ public class ScanManager {
                 if (!mScanNative.isOpportunisticScanClient(client) && (client.filters == null
                         || client.filters.isEmpty())) {
                     /*Suspend unfiltered scans*/
+                    if (client.stats != null) {
+                        client.stats.recordScanSuspend(client.scannerId);
+                    }
+                    handleStopScan(client);
+                    mSuspendedScanClients.add(client);
+                }
+            }
+        }
+        void handleSuspendScanAll() {
+            for (ScanClient client : mRegularScanClients) {
+                if (!mScanNative.isOpportunisticScanClient(client)) {
+                    /*Suspend both unfiltered & filtered scans*/
                     if (client.stats != null) {
                         client.stats.recordScanSuspend(client.scannerId);
                     }
@@ -482,6 +541,8 @@ public class ScanManager {
     }
 
     public int getCurrentUsedTrackingAdvertisement() {
+        Log.d(TAG, "mCurUsedTrackableAdvertisements: "
+                + mCurUsedTrackableAdvertisements);
         return mCurUsedTrackableAdvertisements;
     }
 
@@ -491,6 +552,7 @@ public class ScanManager {
         private static final int DELIVERY_MODE_IMMEDIATE = 0;
         private static final int DELIVERY_MODE_ON_FOUND_LOST = 1;
         private static final int DELIVERY_MODE_BATCH = 2;
+        private static final int DELIVERY_MODE_ROUTE = 8;
 
         private static final int ONFOUND_SIGHTINGS_AGGRESSIVE = 1;
         private static final int ONFOUND_SIGHTINGS_STICKY = 4;
@@ -549,6 +611,7 @@ public class ScanManager {
 
             mAlarmManager = (AlarmManager) mService.getSystemService(Context.ALARM_SERVICE);
             Intent batchIntent = new Intent(ACTION_REFRESH_BATCHED_SCAN, null);
+            batchIntent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
             mBatchScanIntervalIntent = PendingIntent.getBroadcast(mService, 0, batchIntent, 0);
             IntentFilter filter = new IntentFilter();
             filter.addAction(ACTION_REFRESH_BATCHED_SCAN);
@@ -562,9 +625,13 @@ public class ScanManager {
                         if (mBatchClients.isEmpty()) {
                             return;
                         }
-                        // Note this actually flushes all pending batch data.
-                        if (mBatchClients.iterator().hasNext()) {
-                            flushBatchScanResults(mBatchClients.iterator().next());
+                        try {
+                            // Note this actually flushes all pending batch data.
+                            if (mBatchClients.iterator().hasNext()) {
+                                flushBatchScanResults(mBatchClients.iterator().next());
+                            }
+                        } catch (NoSuchElementException e) {
+                            Log.e(TAG, "Element not found: " + e);
                         }
                     }
                 }
@@ -605,7 +672,7 @@ public class ScanManager {
             int phyCnt = 0;
 
 
-            if (client != null) {
+            if (phyInfoResult != null) {
                 curScanSettingLE1M = phyInfoResult.scanModeLE1M;
                 curScanSettingLECoded = phyInfoResult.scanModeLECoded;
                 scanPhy = phyInfoResult.scanPhy;
@@ -619,9 +686,13 @@ public class ScanManager {
                         + "scanPhy=" + scanPhy);
             }
 
+            /* Check whether scan mode for LE 1M PHY has changed and compute the appropriate
+             * scan interval and scan window values
+             */
             if ((curScanSettingLE1M != Integer.MIN_VALUE
                     && curScanSettingLE1M != ScanSettings.SCAN_MODE_OPPORTUNISTIC)) {
-                if (curScanSettingLE1M != mLastConfiguredScanSettingLE1M) {
+                if ((curScanSettingLE1M != mLastConfiguredScanSettingLE1M) ||
+                       (curScanSettingLECoded != mLastConfiguredScanSettingLECoded)) {
                     scanModeChanged = true;
                     ScanSettings settings = new ScanSettings.Builder().setScanMode(curScanSettingLE1M).build();
                     scanWindowLE1M = getScanWindowMillis(settings);
@@ -638,9 +709,14 @@ public class ScanManager {
                     Log.d(TAG, "configureRegularScanParams() - queue emtpy, scan stopped");
                 }
             }
+
+            /* Check whether scan mode for LE Coded PHY has changed and compute the appropriate
+             * scan interval and scan window values
+             */
             if((curScanSettingLECoded != Integer.MIN_VALUE
                     && curScanSettingLECoded != ScanSettings.SCAN_MODE_OPPORTUNISTIC)) {
-                if (curScanSettingLECoded != mLastConfiguredScanSettingLECoded) {
+                if ((curScanSettingLECoded != mLastConfiguredScanSettingLECoded) ||
+                       (curScanSettingLE1M != mLastConfiguredScanSettingLE1M)) {
                     scanModeChanged = true;
                     ScanSettings settings = new ScanSettings.Builder().setScanMode(curScanSettingLECoded).build();
                     scanWindowLECoded = getScanWindowMillis(settings);
@@ -661,7 +737,7 @@ public class ScanManager {
                 if (DBG) {
                     Log.d(TAG, "configureRegularScanParams - scanInterval LE 1M = " + scanIntervalLE1M
                             + "configureRegularScanParams - scanWindow LE 1M= " + scanWindowLE1M
-                            + "configureRegularScanParams - scanWindow LE Coded= " + scanWindowLECoded
+                            + "configureRegularScanParams - scanInterval LE Coded= " + scanIntervalLECoded
                             + "configureRegularScanParams - scanWindow LE Coded= " + scanWindowLECoded);
                 }
                 gattSetScanParametersNative(client.scannerId, scanPhy, scanInterval, scanWindow);
@@ -708,11 +784,23 @@ public class ScanManager {
             return result;
         }
 
-        void startRegularScan(ScanClient client) {
+        boolean startRegularScan(ScanClient client) {
             if (isFilteringSupported() && mFilterIndexStack.isEmpty()
                     && mClientFilterIndexMap.isEmpty()) {
                 initFilterIndexStack();
             }
+
+            if (isRoutingScanClient(client) && (client.filters.size() > mFilterIndexStack.size())) {
+                try {
+                    mService.onScanManagerErrorCallback(client.scannerId,
+                                ScanCallback.SCAN_FAILED_OUT_OF_HARDWARE_RESOURCES);
+                    Log.e(TAG, "startRegularScan, routing scan out of HARDWARE_RESOURCES");
+                } catch (RemoteException e) {
+                    Log.e(TAG, "startRegularScan, routing scan failed on onScanManagerCallback", e);
+                }
+                return false;
+            }
+
             if (isFilteringSupported()) {
                 configureScanFilters(client);
             }
@@ -720,6 +808,7 @@ public class ScanManager {
             if (numRegularScanClients() == 1) {
                 gattClientScanNative(true);
             }
+            return true;
         }
 
         private int numRegularScanClients() {
@@ -746,7 +835,7 @@ public class ScanManager {
 
         private boolean isExemptFromScanDowngrade(ScanClient client) {
             return isOpportunisticScanClient(client) || isFirstMatchScanClient(client)
-                    || !shouldUseAllPassFilter(client);
+                    || !shouldUseAllPassFilter(client) || isRoutingScanClient(client);
         }
 
         private boolean isOpportunisticScanClient(ScanClient client) {
@@ -756,6 +845,10 @@ public class ScanManager {
         private boolean isFirstMatchScanClient(ScanClient client) {
             return (client.settings.getCallbackType() & ScanSettings.CALLBACK_TYPE_FIRST_MATCH)
                     != 0;
+        }
+
+        private boolean isRoutingScanClient(ScanClient client) {
+            return client.settings.getCallbackType() == ScanSettings.CALLBACK_TYPE_SENSOR_ROUTING;
         }
 
         private void resetBatchScan(ScanClient client) {
@@ -1026,16 +1119,20 @@ public class ScanManager {
                         0);
                 waitForCallback();
             } else {
+                Log.d(TAG, "Available Filter size: " + mFilterIndexStack.size());
                 Deque<Integer> clientFilterIndices = new ArrayDeque<Integer>();
                 for (ScanFilter filter : client.filters) {
                     ScanFilterQueue queue = new ScanFilterQueue();
                     queue.addScanFilter(filter);
+                    ScanFilterQueue.Entry[] entries = queue.toArray();
                     int featureSelection = queue.getFeatureSelection();
                     int filterIndex = mFilterIndexStack.pop();
 
-                    resetCountDownLatch();
-                    gattClientScanFilterAddNative(scannerId, queue.toArray(), filterIndex);
-                    waitForCallback();
+                    if (entries != null && entries.length > 0) {
+                        resetCountDownLatch();
+                        gattClientScanFilterAddNative(scannerId, entries, filterIndex);
+                        waitForCallback();
+                    }
 
                     resetCountDownLatch();
                     if (deliveryMode == DELIVERY_MODE_ON_FOUND_LOST) {
@@ -1137,6 +1234,9 @@ public class ScanManager {
             if (client == null) {
                 return true;
             }
+            if (isRoutingScanClient(client)) {
+                return false;
+            }
             if (client.filters == null || client.filters.isEmpty()) {
                 return true;
             }
@@ -1167,7 +1267,7 @@ public class ScanManager {
             onLostTimeout = 10000;
             if (DBG) {
                 Log.d(TAG, "configureFilterParamter " + onFoundTimeout + " " + onLostTimeout + " "
-                        + onFoundCount + " " + numOfTrackingEntries);
+                        + onFoundCount + " " + numOfTrackingEntries + ", deliveryMode=" + deliveryMode);
             }
             FilterParams filtValue =
                     new FilterParams(scannerId, filterIndex, featureSelection, LIST_LOGIC_TYPE,
@@ -1188,6 +1288,9 @@ public class ScanManager {
             if ((settings.getCallbackType() & ScanSettings.CALLBACK_TYPE_FIRST_MATCH) != 0
                     || (settings.getCallbackType() & ScanSettings.CALLBACK_TYPE_MATCH_LOST) != 0) {
                 return DELIVERY_MODE_ON_FOUND_LOST;
+            }
+            if (isRoutingScanClient(client)) {
+                return DELIVERY_MODE_ROUTE;
             }
             return settings.getReportDelayMillis() == 0 ? DELIVERY_MODE_IMMEDIATE
                     : DELIVERY_MODE_BATCH;
@@ -1395,6 +1498,23 @@ public class ScanManager {
         return false;
     }
 
+    public boolean isAptXLowLatencyModeEnabled() {
+        Log.d(TAG, "isAptXLowLatencyModeEnabled: " + mIsAptXLowLatencyModeEnabled);
+        return mIsAptXLowLatencyModeEnabled;
+    }
+
+    public void setAptXLowLatencyMode(boolean enabled){
+        Log.d(TAG, "setAptXLowLatencyMode: mIsAptXLowLatencyModeEnabled: "
+            + mIsAptXLowLatencyModeEnabled + "enabled: " + enabled);
+        mIsAptXLowLatencyModeEnabled = enabled;
+        if (mIsAptXLowLatencyModeEnabled) {
+            sendMessage(MSG_SUSPEND_SCAN_ALL, null);
+        } else {
+            sendMessage(MSG_RESUME_SCANS, null);
+        }
+    }
+
+
     private final DisplayManager.DisplayListener mDisplayListener =
             new DisplayManager.DisplayListener() {
                 @Override
@@ -1405,11 +1525,7 @@ public class ScanManager {
 
                 @Override
                 public void onDisplayChanged(int displayId) {
-                    if (isScreenOn() && mLocationManager.isLocationEnabled()) {
-                        sendMessage(MSG_RESUME_SCANS, null);
-                    } else {
-                        sendMessage(MSG_SUSPEND_SCANS, null);
-                    }
+                    sendMessage(MSG_HANDLE_DISPLAY_CHANGED, null);
                 }
             };
 
@@ -1480,6 +1596,14 @@ public class ScanManager {
         }
         if (updatedScanParams) {
             mScanNative.configureRegularScanParams();
+        }
+    }
+
+    private void handleScanOnDisplayChanged() {
+        if (isScreenOn() && mLocationManager.isLocationEnabled()) {
+            sendMessage(MSG_RESUME_SCANS, null);
+        } else {
+            sendMessage(MSG_SUSPEND_SCANS, null);
         }
     }
 }

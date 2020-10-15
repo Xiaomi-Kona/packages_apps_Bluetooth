@@ -1183,6 +1183,9 @@ static void gattSetScanParametersNative(JNIEnv* env, jobject object,
   }
   sGattIf->scanner->SetScanParameters(
       scan_phy, scan_interval, scan_window,
+  // TODO(b/140404592): Fix this call to SetScanParameters().
+  sGattIf->scanner->SetScanParameters(
+      0, {0,0}, {0,0},
       base::Bind(&set_scan_params_cmpl_cb, client_if));
 }
 
